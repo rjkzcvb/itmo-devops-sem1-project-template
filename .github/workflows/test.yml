@@ -62,19 +62,36 @@ jobs:
 
     - name: Run tests
       run: |
-        # Start server in background
+        # Start server in BACKGROUND
+        echo "🚀 Starting server in background..."
         ./bin/server &
         SERVER_PID=$!
+        echo "Server PID: $SERVER_PID"
         
-        # Wait for server to start
-        sleep 5
+        # Wait for server to be ready
+        echo "⏳ Waiting for server to start..."
+        for i in {1..30}; do
+          if curl -s http://localhost:8080/health > /dev/null; then
+            echo "✅ Server is ready after $i attempts"
+            break
+          fi
+          if [ $i -eq 30 ]; then
+            echo "❌ Server failed to start after 30 attempts"
+            exit 1
+          fi
+          sleep 2
+        done
         
         # Run tests
+        echo "🧪 Running tests..."
+        chmod +x scripts/tests.sh
         ./scripts/tests.sh 1
         TEST_RESULT=$?
         
         # Stop server
+        echo "🛑 Stopping server (PID: $SERVER_PID)..."
         kill $SERVER_PID
+        sleep 2
         
         exit $TEST_RESULT
 
