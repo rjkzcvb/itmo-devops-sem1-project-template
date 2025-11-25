@@ -18,7 +18,11 @@ echo "✅ Dependencies installed"
 
 # Build the application
 echo "🔨 Building application..."
+mkdir -p bin
 go build -o bin/server main.go
 
 echo "🎉 Preparation completed!"
-echo "💡 Note: PostgreSQL check skipped. Ensure database is running manually."
+echo ""
+echo "📋 Next steps:"
+echo "  1. Run: ./scripts/run.sh"
+echo "  2. Test: ./scripts/tests.sh 1"
