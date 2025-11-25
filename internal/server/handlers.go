@@ -55,10 +55,9 @@ func (s *Server) processZipFile(zipData []byte) (*models.UploadStats, error) {
 		return nil, fmt.Errorf("failed to read zip: %v", err)
 	}
 
-	// Find CSV file (ищем в любом месте архива)
+	// Find CSV file
 	var csvFile *zip.File
 	for _, file := range zipReader.File {
-		// Ищем любой CSV файл, независимо от пути
 		if strings.HasSuffix(file.Name, ".csv") {
 			csvFile = file
 			break
@@ -66,7 +65,6 @@ func (s *Server) processZipFile(zipData []byte) (*models.UploadStats, error) {
 	}
 
 	if csvFile == nil {
-		// Покажем какие файлы есть в архиве для отладки
 		fileList := make([]string, len(zipReader.File))
 		for i, file := range zipReader.File {
 			fileList[i] = file.Name
@@ -90,28 +88,10 @@ func (s *Server) processZipFile(zipData []byte) (*models.UploadStats, error) {
 func (s *Server) parseAndInsertCSV(reader io.Reader) (*models.UploadStats, error) {
 	csvReader := csv.NewReader(reader)
 	
-	stats := &models.UploadStats{}
-	categories := make(map[string]bool)
-
-	// Begin transaction
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("failed to begin transaction: %v", err)
-	}
-	defer tx.Rollback()
-
-	// Prepare insert statement
-	stmt, err := tx.Prepare(`
-		INSERT INTO prices (product_id, created_date, product_name, category, price) 
-		VALUES ($1, $2, $3, $4, $5)
-	`)
-	if err != nil {
-		return nil, fmt.Errorf("failed to prepare statement: %v", err)
-	}
-	defer stmt.Close()
-
-	// Read CSV records
+	// 1. Сначала читаем и валидируем все записи из CSV
+	var validRecords []*models.PriceRecord
 	lineNumber := 0
+	
 	for {
 		record, err := csvReader.Read()
 		if err == io.EOF {
@@ -128,84 +108,131 @@ func (s *Server) parseAndInsertCSV(reader io.Reader) (*models.UploadStats, error
 			continue
 		}
 
-		// Skip header row (проверяем если первое поле выглядит как заголовок)
+		// Skip header row
 		if lineNumber == 1 {
-			// Проверяем если первое поле содержит "id" (заголовок)
-			if record[0] == "id" || strings.Contains(strings.ToLower(record[0]), "id") {
-				continue // Пропускаем заголовок
+			if record[0] == "id" || record[0] == "name" || strings.Contains(strings.ToLower(record[0]), "id") {
+				continue
 			}
 		}
 
-		// Parse record (5 fields expected)
-		if len(record) != 5 {
-			return nil, fmt.Errorf("invalid CSV format at line %d: expected 5 fields, got %d", lineNumber, len(record))
+		// Validate record length
+		if len(record) != 4 {
+			return nil, fmt.Errorf("invalid CSV format at line %d: expected 4 fields, got %d", lineNumber, len(record))
 		}
 
+		// Parse and validate record
 		priceRecord, err := parseCSVRecord(record)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse record at line %d: %v", lineNumber, err)
 		}
 
-		// Insert into database
+		validRecords = append(validRecords, priceRecord)
+	}
+
+	if len(validRecords) == 0 {
+		return nil, fmt.Errorf("no valid records found in CSV")
+	}
+
+	// 2. Только после валидации открываем транзакцию
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	// Prepare insert statement
+	stmt, err := tx.Prepare(`
+		INSERT INTO prices (name, category, price, create_date) 
+		VALUES ($1, $2, $3, $4)
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to prepare statement: %v", err)
+	}
+	defer stmt.Close()
+
+	// Insert all valid records
+	for _, record := range validRecords {
 		_, err = stmt.Exec(
-			priceRecord.ProductID,
-			priceRecord.CreatedDate,
-			priceRecord.ProductName,
-			priceRecord.Category,
-			priceRecord.Price,
+			record.ProductName,
+			record.Category,
+			record.Price,
+			record.CreatedDate,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to insert record at line %d: %v", lineNumber, err)
+			return nil, fmt.Errorf("failed to insert record: %v", err)
 		}
-
-		// Update statistics
-		stats.TotalItems++
-		stats.TotalPrice += priceRecord.Price
-		categories[priceRecord.Category] = true
 	}
+
+	// 3. Считаем статистику по всей БД агрегирующими запросами
+	stats, err := s.calculateStats(tx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate statistics: %v", err)
+	}
+	
+	stats.TotalItems = len(validRecords) // Только количество загруженных записей
 
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("failed to commit transaction: %v", err)
 	}
 
-	stats.TotalCategories = len(categories)
+	return stats, nil
+}
+
+func (s *Server) calculateStats(tx *sql.Tx) (*models.UploadStats, error) {
+	stats := &models.UploadStats{}
+
+	// Считаем общую сумму цен по всей БД
+	err := tx.QueryRow(`
+		SELECT COALESCE(SUM(price), 0) 
+		FROM prices
+	`).Scan(&stats.TotalPrice)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate total price: %v", err)
+	}
+
+	// Считаем количество уникальных категорий по всей БД
+	err = tx.QueryRow(`
+		SELECT COUNT(DISTINCT category) 
+		FROM prices
+	`).Scan(&stats.TotalCategories)
+	if err != nil {
+		return nil, fmt.Errorf("failed to count categories: %v", err)
+	}
+
 	return stats, nil
 }
 
 func parseCSVRecord(record []string) (*models.PriceRecord, error) {
-	// Парсим согласно реальной структуре CSV:
-	// [0] = id (product_id)
-	// [1] = name (product_name) 
-	// [2] = category
-	// [3] = price
-	// [4] = create_date (created_date)
+	// [0] = name (product_name)
+	// [1] = category
+	// [2] = price
+	// [3] = create_date
 
-	// Parse date (format: ГОД-МЕСЯЦ-ДЕНЬ)
-	createdDate, err := time.Parse("2006-01-02", record[4])
+	// Parse date
+	createdDate, err := time.Parse("2006-01-02", record[3])
 	if err != nil {
-		return nil, fmt.Errorf("invalid date format: %s", record[4])
+		return nil, fmt.Errorf("invalid date format: %s", record[3])
 	}
 
 	// Parse price
-	price, err := strconv.ParseFloat(record[3], 64)
+	price, err := strconv.ParseFloat(record[2], 64)
 	if err != nil {
-		return nil, fmt.Errorf("invalid price format: %s", record[3])
+		return nil, fmt.Errorf("invalid price format: %s", record[2])
 	}
 
 	return &models.PriceRecord{
-		ProductID:   record[0],    // id
-		CreatedDate: createdDate,  // create_date
-		ProductName: record[1],    // name
-		Category:    record[2],    // category
-		Price:       price,        // price
+		ProductName: record[0],
+		Category:    record[1],
+		Price:       price,
+		CreatedDate: createdDate,
 	}, nil
 }
 
 func (s *Server) DownloadPrices(w http.ResponseWriter, r *http.Request) {
-	// Get all data from database
+	// 1. Сначала вычитываем все данные из курсора
 	rows, err := s.db.Query(`
-		SELECT product_id, created_date, product_name, category, price 
+		SELECT name, category, price, create_date 
 		FROM prices 
 		ORDER BY id
 	`)
@@ -215,33 +242,46 @@ func (s *Server) DownloadPrices(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
-	// Create CSV data
-	var csvData strings.Builder
-	csvData.WriteString("product_id,created_date,product_name,category,price\n")
+	// 2. Сохраняем все данные в память
+	var records []struct {
+		name       string
+		category   string
+		price      float64
+		createDate time.Time
+	}
 
 	for rows.Next() {
-		var productID, productName, category string
-		var createdDate time.Time
-		var price float64
+		var rec struct {
+			name       string
+			category   string
+			price      float64
+			createDate time.Time
+		}
 
-		err := rows.Scan(&productID, &createdDate, &productName, &category, &price)
+		err := rows.Scan(&rec.name, &rec.category, &rec.price, &rec.createDate)
 		if err != nil {
 			http.Error(w, "Failed to scan row: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-
-		csvData.WriteString(fmt.Sprintf("%s,%s,%s,%s,%.2f\n",
-			productID,
-			createdDate.Format("2006-01-02"),
-			productName,
-			category,
-			price,
-		))
+		records = append(records, rec)
 	}
 
 	if err = rows.Err(); err != nil {
 		http.Error(w, "Error iterating rows: "+err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// 3. Только после чтения всех данных создаем CSV
+	var csvData strings.Builder
+	csvData.WriteString("name,category,price,create_date\n")
+
+	for _, record := range records {
+		csvData.WriteString(fmt.Sprintf("%s,%s,%.2f,%s\n",
+			record.name,
+			record.category,
+			record.price,
+			record.createDate.Format("2006-01-02"),
+		))
 	}
 
 	// Create ZIP archive in memory
